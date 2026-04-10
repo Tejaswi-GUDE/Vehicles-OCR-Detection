@@ -1,45 +1,40 @@
-import ssl
+import os
 import re
 import cv2
 import easyocr
 import numpy as np
-import streamlit as st
-from PIL import Image
 
-ssl._create_default_https_context = ssl._create_unverified_context
-st.set_page_config(page_title="Vehicle Number Scanner", page_icon="🚗", layout="centered")
-
-@st.cache_resource
-def load_reader():
-    return easyocr.Reader(['en'], gpu=False)
-
-reader = load_reader()
+reader = easyocr.Reader(['en'], gpu=False)
 
 INDIAN_PLATE_PATTERNS = [
-    r'^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$',      # MH12AB1234
-    r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{3,4}$', # Flexible common Indian pattern
-    r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$'            # 22BH1234AB
+    r'^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$',
+    r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{3,4}$',
+    r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$'
 ]
 
 def clean_text(text):
-    return re.sub(r'[^A-Z0-9]', '', text.upper())
+    text = re.sub(r'[^A-Z0-9]', '', text.upper())
+    if len(text) > 10:
+        text = text[:10]
+    return text
 
 def is_valid_indian_plate(text):
     return any(re.match(pattern, text) for pattern in INDIAN_PLATE_PATTERNS)
 
 def normalize_common_misreads(text):
-    chars = list(text)
-    if len(chars) >= 4:
-        for i in range(len(chars) - 4, len(chars)):
-            if chars[i] == 'O':
-                chars[i] = '0'
-            elif chars[i] == 'I':
-                chars[i] = '1'
-            elif chars[i] == 'Z':
-                chars[i] = '2'
-            elif chars[i] == 'S':
-                chars[i] = '5'
-    return ''.join(chars)
+    replacements = {
+        'O': '0', 'I': '1', 'Z': '2',
+        'S': '5', 'B': '8'
+    }
+
+    corrected = ""
+    for i, ch in enumerate(text):
+        if i >= len(text) - 4:
+            corrected += replacements.get(ch, ch)
+        else:
+            corrected += ch
+
+    return corrected
 
 def plate_score(text, conf):
     score = conf
@@ -49,8 +44,8 @@ def plate_score(text, conf):
         score += 0.5
     return score
 
-def detect_plate_regions(img_rgb):
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+def detect_plate_regions(img_bgr):
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.bilateralFilter(gray, 11, 17, 17)
 
     blackhat_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
@@ -73,7 +68,7 @@ def detect_plate_regions(img_rgb):
     contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     regions = []
-    h_img, w_img = img_rgb.shape[:2]
+    h_img, w_img = img_bgr.shape[:2]
 
     for c in contours:
         x, y, w, h = cv2.boundingRect(c)
@@ -87,6 +82,10 @@ def detect_plate_regions(img_rgb):
         if w < 60 or h < 20:
             continue
 
+        mean_intensity = np.mean(gray[y:y+h, x:x+w])
+        if mean_intensity < 50 or mean_intensity > 200:
+            continue
+
         pad_x = int(w * 0.08)
         pad_y = int(h * 0.15)
 
@@ -95,35 +94,53 @@ def detect_plate_regions(img_rgb):
         x2 = min(w_img, x + w + pad_x)
         y2 = min(h_img, y + h + pad_y)
 
-        crop = img_rgb[y1:y2, x1:x2]
+        crop = img_bgr[y1:y2, x1:x2]
         regions.append((crop, area))
 
     regions = sorted(regions, key=lambda r: r[1], reverse=True)
     return [r[0] for r in regions[:5]]
 
-def generate_ocr_variants(crop_rgb):
-    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
-    blur = cv2.bilateralFilter(gray, 11, 17, 17)
+def generate_ocr_variants(crop_bgr):
+    gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(gray)
+
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5,-1],
+                       [0, -1, 0]])
+    sharpened = cv2.filter2D(enhanced, -1, kernel)
+
+    blur = cv2.bilateralFilter(sharpened, 11, 17, 17)
 
     otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     adaptive = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 11, 2
     )
-    enlarged_gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    enlarged_otsu = cv2.resize(otsu, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
 
-    return [gray, otsu, adaptive, enlarged_gray, enlarged_otsu]
+    resized = cv2.resize(blur, None, fx=2.5, fy=2.5, interpolation=cv2.INTER_CUBIC)
 
-def extract_best_plate(img_rgb, reader):
+    return [blur, otsu, adaptive, resized]
+
+def extract_vehicle_number(image_path):
+    if not os.path.exists(image_path):
+        return "Error: Image file not found!"
+
+    img = cv2.imread(image_path)
+    if img is None:
+        return "Error: Unable to read image!"
+
+    img = cv2.resize(img, (640, 480))
+
     candidates = []
-
-    plate_regions = detect_plate_regions(img_rgb)
+    plate_regions = detect_plate_regions(img)
 
     if not plate_regions:
-        plate_regions = [img_rgb]
+        plate_regions = [img]
 
-    for crop_rgb in plate_regions:
-        variants = generate_ocr_variants(crop_rgb)
+    for crop in plate_regions:
+        variants = generate_ocr_variants(crop)
 
         for variant in variants:
             results = reader.readtext(
@@ -132,15 +149,13 @@ def extract_best_plate(img_rgb, reader):
                 paragraph=False,
                 allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
                 decoder='beamsearch',
-                beamWidth=10,
-                rotation_info=[90, 180, 270],
-                contrast_ths=0.1,
-                adjust_contrast=0.5,
-                text_threshold=0.6,
-                low_text=0.3,
-                link_threshold=0.4,
-                mag_ratio=1.5,
-                canvas_size=3000
+                beamWidth=5,
+                rotation_info=[0],
+                text_threshold=0.7,
+                low_text=0.4,
+                link_threshold=0.5,
+                mag_ratio=1.8,
+                canvas_size=2560
             )
 
             merged = ""
@@ -160,7 +175,6 @@ def extract_best_plate(img_rgb, reader):
 
                 if len(text) >= 6:
                     candidates.append((text, conf))
-
                     corrected = normalize_common_misreads(text)
                     if corrected != text:
                         candidates.append((corrected, conf - 0.05))
@@ -169,13 +183,12 @@ def extract_best_plate(img_rgb, reader):
                 avg_conf = conf_sum / count
                 if len(merged) >= 6:
                     candidates.append((merged, avg_conf))
-
                     corrected_merged = normalize_common_misreads(merged)
                     if corrected_merged != merged:
                         candidates.append((corrected_merged, avg_conf - 0.05))
 
     if not candidates:
-        return None
+        return "No valid plate detected"
 
     unique_candidates = {}
     for text, conf in candidates:
@@ -189,35 +202,16 @@ def extract_best_plate(img_rgb, reader):
     )
 
     for text, conf in ranked:
+        if conf < 0.4:
+            continue
         if is_valid_indian_plate(text):
             return text
 
-    return ranked[0][0] if ranked else None
+    return ranked[0][0] if ranked else "No valid plate detected"
 
-st.title("🚗 Vehicle Number Scanner")
-st.write("Upload a vehicle image or cropped number plate image.")
 
-uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
-
-if uploaded_file:
-    image = Image.open(uploaded_file).convert("RGB")
-    img_array = np.array(image)
-
-    st.image(image, caption="Uploaded Image", use_container_width=True)
-
-    if st.button("🚀 Scan Vehicle Number"):
-        with st.spinner("Scanning with EasyOCR..."):
-            plate_no = extract_best_plate(img_array, reader)
-
-            if plate_no:
-                st.success(f"Extracted Number: {plate_no}")
-
-                if is_valid_indian_plate(plate_no):
-                    st.info("Valid Indian number plate format ✅")
-                else:
-                    st.warning("Text detected, but format validation is weak ⚠️")
-            else:
-                st.error("No valid plate detected. Try a clearer or cropped image.")
-
-st.markdown("---")
-st.caption("Developed with Streamlit + EasyOCR")
+if __name__ == "__main__":
+    test_image = "test_plate.jpg"
+    print(f"Processing: {test_image} ...")
+    result = extract_vehicle_number(test_image)
+    print(f"Final Output: {result}")
